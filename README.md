@@ -206,6 +206,24 @@ write hasn't happened yet) or all session files in that dir have birth
 times older than the process's start time. Usually self-resolves once the
 session writes once.
 
+**App crashes on launch on Sonoma 14.6+.** Almost always a missing ad-hoc
+code signature or LaunchServices registration — symptoms include the app
+showing in Activity Monitor for ~1 second then disappearing, with a crash
+log mentioning `+[UNUserNotificationCenter currentNotificationCenter]_block_invoke`
+and `bundleProxyForCurrentProcess`. Fix by rebuilding cleanly with the
+current Makefile, which adds `codesign --sign -` (ad-hoc signature) and
+`lsregister -f` (LaunchServices registration):
+
+```sh
+make clean
+rm -rf ~/Applications/CCBar.app
+make install
+open ~/Applications/CCBar.app
+```
+
+If you previously installed an unsigned version, also clear quarantine on
+the new copy: `xattr -cr ~/Applications/CCBar.app`.
+
 **Keep-awake doesn't work.** Verify the assertion is held:
 
 ```sh

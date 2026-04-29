@@ -7,9 +7,10 @@ final class GitHubMonitor {
     private var lastCheck: [String: CheckState] = [:]   // PR id → last seen
     private var notifiedReady: Set<String> = []         // dedup ready-to-merge
     private var notifiedFailedRuns: Set<String> = []    // dedup Action failures
+    private var unGateFailed = false                    // skip UN if it ever fails
 
     func evaluate(prs: [GitHubPR], failedRuns: [FailedRun]) {
-        guard Bundle.main.bundleIdentifier != nil else { return }
+        guard !unGateFailed, Bundle.main.bundleIdentifier != nil else { return }
 
         // Failed Action runs: notify once per run (id is unique per run).
         // The set bounds memory loosely — old run IDs eventually fade out as

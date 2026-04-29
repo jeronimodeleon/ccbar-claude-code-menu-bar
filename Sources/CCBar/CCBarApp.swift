@@ -646,10 +646,10 @@ struct WorktreeRow: View {
 }
 
 // macOS 13+ SMAppService — registers the .app bundle to launch at login.
-// Reads current state on init and writes through on toggle. If the app is
-// running from outside the bundle (rare), register() throws and we revert.
+// We defer the SMAppService.mainApp.status read until .onAppear so that any
+// framework-level abort there can't take down the whole app at launch.
 struct LaunchAtLoginToggle: View {
-    @State private var enabled: Bool = SMAppService.mainApp.status == .enabled
+    @State private var enabled = false
 
     var body: some View {
         Toggle("Launch at login", isOn: Binding(
@@ -666,6 +666,9 @@ struct LaunchAtLoginToggle: View {
         ))
         .toggleStyle(.checkbox)
         .font(.caption)
+        .onAppear {
+            enabled = SMAppService.mainApp.status == .enabled
+        }
     }
 }
 

@@ -7,21 +7,24 @@ import UserNotifications
 final class IdleNotifier {
     private static let idleThreshold: TimeInterval = 600   // 10 minutes
     private var notifiedSessionIds = Set<String>()         // dedup per idle period
+    private var authorizationRequested = false
     private var authorizationGranted = false
 
-    func requestAuthorization() {
-        // UNUserNotificationCenter requires a proper .app bundle context
-        // (Info.plist + bundle ID). Running the bare binary from `build/`
-        // would crash here — guard so the app stays usable even unbundled.
-        guard Bundle.main.bundleIdentifier != nil else { return }
-        UNUserNotificationCenter.current().requestAuthorization(options: [.alert, .sound]) { [weak self] granted, _ in
-            self?.authorizationGranted = granted
-        }
-    }
+    // No-op: kept for source-compatibility with AppState.start(). We *defer*
+    // touching UNUserNotificationCenter until the first time we actually have
+    // something to notify. Calling +currentNotificationCenter at app launch
+    // can abort the whole process on macOS Sonoma+ if the bundle's identity
+    // isn't fully resolved, so we never call it eagerly.
+    func requestAuthorization() {}
 
-    // Call on each scan. Looks for sessions over threshold that haven't been
-    // notified yet, and clears dedup for sessions that came back to life.
+    // Call on each scan. Lazily requests authorization the first time we'd
+    // actually fire something. Skips silently if anything goes wrong.
     func evaluate(sessions: [ClaudeSession]) {
+        let needAttention = sessions.contains { s in
+            s.isAwaitingInput && s.idleSeconds >= Self.idleThreshold
+        }
+        guard needAttention else { return }
+        ensureAuthorization()
         guard authorizationGranted else { return }
 
         var stillIdle = Set<String>()
@@ -38,6 +41,15 @@ final class IdleNotifier {
         // typed something) gets its dedup flag cleared so the next idle period
         // can notify again.
         notifiedSessionIds = notifiedSessionIds.intersection(stillIdle)
+    }
+
+    private func ensureAuthorization() {
+        guard !authorizationRequested else { return }
+        authorizationRequested = true
+        guard Bundle.main.bundleIdentifier != nil else { return }
+        UNUserNotificationCenter.current().requestAuthorization(options: [.alert, .sound]) { [weak self] granted, _ in
+            self?.authorizationGranted = granted
+        }
     }
 
     private func notify(session: ClaudeSession) {
