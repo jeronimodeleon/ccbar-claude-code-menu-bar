@@ -12,9 +12,13 @@ final class GitHubMonitor {
     func evaluate(prs: [GitHubPR], failedRuns: [FailedRun]) {
         guard !unGateFailed, Bundle.main.bundleIdentifier != nil else { return }
 
+        // GitHubScanner returns an empty snapshot when `gh` is unauthenticated
+        // or the API call fails, which is indistinguishable here from "nothing
+        // open". Bail before the prunes below so an offline minute can't drop
+        // every dedup flag and re-notify the whole backlog on reconnect.
+        guard !prs.isEmpty || !failedRuns.isEmpty else { return }
+
         // Failed Action runs: notify once per run (id is unique per run).
-        // The set bounds memory loosely — old run IDs eventually fade out as
-        // GitHub stops returning them in the recent-runs window.
         for run in failedRuns where !notifiedFailedRuns.contains(run.id) {
             notify(
                 id: "ccbar.run.\(run.id)",
@@ -26,7 +30,9 @@ final class GitHubMonitor {
         }
 
         var stillReady: Set<String> = []
+        var seenPRs: Set<String> = []
         for pr in prs {
+            seenPRs.insert(pr.id)
             // Notify on every transition into a failing state. A check that
             // stays failing doesn't re-notify; a flake that fails → success →
             // fails again will notify each time it lands in the failing state.
@@ -59,7 +65,15 @@ final class GitHubMonitor {
                 }
             }
         }
-        notifiedReady = notifiedReady.intersection(stillReady)
+        notifiedReady.formIntersection(stillReady)
+
+        // Drop state for PRs and runs this pass no longer returns. The GraphQL
+        // query filters `states: OPEN`, so a merged or closed PR would
+        // otherwise keep its entry forever — and if it were reopened weeks
+        // later, `wasFailing` would be read from that stale entry instead of
+        // being re-established from what the check rollup actually reports.
+        lastCheck = lastCheck.filter { seenPRs.contains($0.key) }
+        notifiedFailedRuns.formIntersection(Set(failedRuns.map(\.id)))
     }
 
     private func notify(id: String, title: String, body: String, url: String) {

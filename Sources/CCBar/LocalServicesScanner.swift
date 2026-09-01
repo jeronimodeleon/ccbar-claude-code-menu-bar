@@ -56,21 +56,16 @@ final class LocalServicesScanner {
     }
 
     // Reused pattern from TabScanner: lsof of cwd FDs, AND-filtered to PID list.
+    // -b -w keeps lsof off the blocking kernel calls that strand it in
+    // uninterruptible state on a hung mount (where even SIGKILL won't reach it).
     private func fetchCwds(for pids: [Int32]) -> [Int32: String] {
         guard !pids.isEmpty else { return [:] }
-        let task = Process()
-        task.launchPath = "/usr/sbin/lsof"
-        task.arguments = ["-a",
-                          "-p", pids.map(String.init).joined(separator: ","),
-                          "-d", "cwd",
-                          "-Fpn"]
-        let pipe = Pipe()
-        task.standardOutput = pipe
-        task.standardError = Pipe()
-        do { try task.run() } catch { return [:] }
-        let data = pipe.fileHandleForReading.readDataToEndOfFile()
-        task.waitUntilExit()
-        guard let out = String(data: data, encoding: .utf8) else { return [:] }
+        guard let out = Subprocess.run("/usr/sbin/lsof",
+                                       ["-b", "-w", "-a",
+                                        "-p", pids.map(String.init).joined(separator: ","),
+                                        "-d", "cwd",
+                                        "-Fpn"])
+        else { return [:] }
 
         var result: [Int32: String] = [:]
         var currentPid: Int32?
@@ -86,19 +81,19 @@ final class LocalServicesScanner {
     }
 
     private func runLsof() -> String? {
-        let task = Process()
-        task.launchPath = "/usr/sbin/lsof"
+        // -b -w               → keep lsof off kernel calls that can block on a
+        //                       hung mount (see fetchCwds)
+        // -a                  → AND the filters. Without it lsof ORs them, so
+        //                       "-u <user>" alone matched every open FD this
+        //                       user owns: 27k lines instead of 9, re-split on
+        //                       every 20s pass, and ~43 rows whose paths merely
+        //                       end in ":<digits>" were parsed as live services.
         // -iTCP -sTCP:LISTEN  → only TCP listening sockets
         // -P -n               → numeric ports/hosts (no DNS)
         // -u <user>           → restrict to current user (drops mDNSResponder, etc.)
-        task.arguments = ["-iTCP", "-sTCP:LISTEN", "-P", "-n", "-u", NSUserName()]
-        let pipe = Pipe()
-        task.standardOutput = pipe
-        task.standardError = Pipe()
-        do { try task.run() } catch { return nil }
-        let data = pipe.fileHandleForReading.readDataToEndOfFile()
-        task.waitUntilExit()
-        return String(data: data, encoding: .utf8)
+        Subprocess.run("/usr/sbin/lsof",
+                       ["-b", "-w", "-a", "-iTCP", "-sTCP:LISTEN", "-P", "-n", "-u", NSUserName()],
+                       timeout: 3)   // now milliseconds of work; a stall is a real hang
     }
 
     private func parse(_ output: String) -> [LocalService] {

@@ -6,6 +6,12 @@ import UserNotifications
 // becomes active again).
 final class IdleNotifier {
     private static let idleThreshold: TimeInterval = 600   // 10 minutes
+
+    // All mutable state below is confined to this serial queue. Callers reach
+    // us from the scan queue while UNUserNotificationCenter's authorization
+    // callback lands on a UN-internal queue, so without the hop the granted
+    // flag had two writer threads and no ordering between them.
+    private let queue = DispatchQueue(label: "com.ccbar.idle-notifier")
     private var notifiedSessionIds = Set<String>()         // dedup per idle period
     private var authorizationRequested = false
     private var authorizationGranted = false
@@ -17,30 +23,32 @@ final class IdleNotifier {
     // isn't fully resolved, so we never call it eagerly.
     func requestAuthorization() {}
 
-    // Call on each scan. Lazily requests authorization the first time we'd
-    // actually fire something. Skips silently if anything goes wrong.
+    // Call on each scan, from any thread. Work is handed to our own queue so
+    // the dedup set and auth flags stay single-threaded.
     func evaluate(sessions: [ClaudeSession]) {
-        let needAttention = sessions.contains { s in
-            s.isAwaitingInput && s.idleSeconds >= Self.idleThreshold
-        }
-        guard needAttention else { return }
+        queue.async { [weak self] in self?.evaluateOnQueue(sessions: sessions) }
+    }
+
+    // Lazily requests authorization the first time we'd actually fire
+    // something. Skips silently if anything goes wrong.
+    private func evaluateOnQueue(sessions: [ClaudeSession]) {
+        let idle = sessions.filter { $0.isAwaitingInput && $0.idleSeconds >= Self.idleThreshold }
+
+        // Clear dedup flags for sessions that are no longer idle, BEFORE the
+        // early return. The pass that observes a session going active is, on a
+        // one-session-at-a-time machine, exactly the pass where nothing is idle
+        // — so pruning behind the guard never ran and every session notified
+        // once for the lifetime of the app.
+        notifiedSessionIds.formIntersection(Set(idle.map(\.sessionId)))
+
+        guard !idle.isEmpty else { return }
         ensureAuthorization()
         guard authorizationGranted else { return }
 
-        var stillIdle = Set<String>()
-        for session in sessions where session.isAwaitingInput {
-            if session.idleSeconds >= Self.idleThreshold {
-                stillIdle.insert(session.sessionId)
-                if !notifiedSessionIds.contains(session.sessionId) {
-                    notify(session: session)
-                    notifiedSessionIds.insert(session.sessionId)
-                }
-            }
+        for session in idle where !notifiedSessionIds.contains(session.sessionId) {
+            notify(session: session)
+            notifiedSessionIds.insert(session.sessionId)
         }
-        // A session that transitioned out of "awaiting input" (because user
-        // typed something) gets its dedup flag cleared so the next idle period
-        // can notify again.
-        notifiedSessionIds = notifiedSessionIds.intersection(stillIdle)
     }
 
     private func ensureAuthorization() {
@@ -48,7 +56,8 @@ final class IdleNotifier {
         authorizationRequested = true
         guard Bundle.main.bundleIdentifier != nil else { return }
         UNUserNotificationCenter.current().requestAuthorization(options: [.alert, .sound]) { [weak self] granted, _ in
-            self?.authorizationGranted = granted
+            guard let self else { return }
+            self.queue.async { self.authorizationGranted = granted }
         }
     }
 

@@ -40,12 +40,27 @@ private extension String {
     func truncated(to n: Int) -> String { count <= n ? self : prefix(n) + "…" }
 }
 
+// Not thread-safe by design: `cache` is a plain dictionary. AppState confines
+// this scanner to its serial fast queue, so one pass runs at a time.
 final class ClaudeSessionScanner {
+    // A nil session is a tombstone: "parsed at this mtime, yielded no cwd".
+    // It keeps an unparseable transcript from being re-read on every pass.
+    typealias CacheEntry = (mtime: Date, session: ClaudeSession?)
+
     private let projectsDir = (NSHomeDirectory() as NSString).appendingPathComponent(".claude/projects")
-    private var cache: [String: (mtime: Date, session: ClaudeSession)] = [:]
+    private var cache: [String: CacheEntry] = [:]
 
     func scan() -> [ClaudeSession] {
+        // Bailing here skips the `cache = fresh` swap, so nothing is evicted
+        // this pass — harmless and self-correcting on the next one.
         guard let dirs = try? FileManager.default.contentsOfDirectory(atPath: projectsDir) else { return [] }
+
+        // Each pass builds its own dictionary and carries forward only the
+        // entries it still sees on disk, then swaps it in at the end. That
+        // makes the cache self-evicting (a deleted .jsonl stops costing us
+        // memory) and keeps every mutation local to the running pass.
+        var fresh: [String: CacheEntry] = [:]
+        fresh.reserveCapacity(cache.count)
 
         var result: [ClaudeSession] = []
         for dirName in dirs {
@@ -53,19 +68,23 @@ final class ClaudeSessionScanner {
             guard let files = try? FileManager.default.contentsOfDirectory(atPath: dirPath) else { continue }
             for file in files where file.hasSuffix(".jsonl") {
                 let filePath = (dirPath as NSString).appendingPathComponent(file)
-                if let session = parse(path: filePath) {
+                if let session = parse(path: filePath, into: &fresh) {
                     result.append(session)
                 }
             }
         }
+        cache = fresh
         return result
     }
 
-    private func parse(path: String) -> ClaudeSession? {
+    private func parse(path: String, into fresh: inout [String: CacheEntry]) -> ClaudeSession? {
         let attrs = try? FileManager.default.attributesOfItem(atPath: path)
         guard let mtime = attrs?[.modificationDate] as? Date else { return nil }
         let creationDate = (attrs?[.creationDate] as? Date) ?? mtime
-        if let cached = cache[path], cached.mtime == mtime { return cached.session }
+        if let cached = cache[path], cached.mtime == mtime {
+            fresh[path] = cached
+            return cached.session
+        }
 
         let sessionId = ((path as NSString).lastPathComponent as NSString).deletingPathExtension
 
@@ -77,8 +96,16 @@ final class ClaudeSessionScanner {
         let tail = readBytes(path: path, atStart: false, bytes: 16_384) ?? ""
         let (lastType, lastStop, lastPrompt) = parseTail(tail)
 
-        // Without a cwd we can't match this session to a tab — skip it.
-        guard let projectPath = cwd else { return nil }
+        // Without a cwd we can't match this session to a tab — skip it, but
+        // record a tombstone first. A head read yields no cwd when the first
+        // record exceeds the 16 KB window or when that window splits a
+        // multi-byte UTF-8 sequence (String(data:encoding:) then returns nil),
+        // and both fail identically on every retry. Keying on mtime means the
+        // file is re-read only once it actually changes.
+        guard let projectPath = cwd else {
+            fresh[path] = (mtime, nil)
+            return nil
+        }
 
         let session = ClaudeSession(
             sessionId: sessionId,
@@ -93,7 +120,7 @@ final class ClaudeSessionScanner {
             lastEntryType: lastType,
             lastStopReason: lastStop
         )
-        cache[path] = (mtime, session)
+        fresh[path] = (mtime, session)
         return session
     }
 

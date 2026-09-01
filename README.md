@@ -19,6 +19,12 @@ input, what services are running, and whether your PRs are green.
   time + `.jsonl` birth time.
 - **Idle-session notifications** — fires a macOS notification when a Claude
   session has been waiting on input for >10 minutes.
+- **Memory** — an always-visible used-memory percentage in the menu bar, plus
+  a footer row with used/total, the kernel's memory-pressure level and swap
+  in use. Severity colouring is driven by the kernel's pressure level rather
+  than the percentage: macOS deliberately keeps RAM near-full even when
+  healthy, so a percentage threshold would be lit permanently. Per-tab
+  resident memory shows which Claude session is actually eating the machine.
 - **Local services** — every TCP port your user is listening on, with
   click-to-open in the browser for HTTP-ish ports and copy-to-clipboard for
   databases and other non-HTTP services.
@@ -52,9 +58,14 @@ input, what services are running, and whether your PRs are green.
 
 ```sh
 cd ~/Documents/team/CCBar
-make install          # builds + copies CCBar.app to ~/Applications
-open ~/Applications/CCBar.app
+make install          # builds + installs CCBar.app
+open ~/Applications/CCBar.app   # or /Applications, if it's already there
 ```
+
+`make install` updates the copy you already have — `/Applications` if CCBar
+lives there, otherwise `~/Applications`. Installing blindly to
+`~/Applications` would leave an existing `/Applications` copy stale, so you'd
+keep launching the old binary.
 
 Then click the menu bar icon → check **Launch at login** at the bottom of the
 popover. CCBar will now start on every boot.
@@ -66,7 +77,9 @@ Available `make` targets:
 | `make build`    | Compile binary into `build/CCBar`                   |
 | `make app`      | Bundle into `build/CCBar.app`                       |
 | `make run`      | Build app + run it from `build/` (Ctrl-C to quit)   |
-| `make install`  | Copy bundle to `~/Applications/CCBar.app`           |
+| `make install`  | Install over the existing copy (else `~/Applications`) |
+| `make test`     | Pure-logic self-checks (pressure mapping, hysteresis)  |
+| `make tsan`     | Thread Sanitizer build, for verifying the scan queues  |
 | `make clean`    | Delete `build/`                                     |
 
 ### Important note about launch-at-login
@@ -129,16 +142,26 @@ CCBar is a SwiftUI `MenuBarExtra` accessory app (no Dock icon, no menu bar
 top menu). All polling happens off the main thread; the UI re-renders when
 published state updates.
 
-Refresh cadences:
+Scanning runs on two independent *serial* queues, split by cost, because the
+scanners keep unsynchronised caches and overlapping passes corrupted them:
 
-- **5s**: terminal tabs (`ps`), local services (`lsof`), Claude sessions
-  (file watcher on `~/.claude/projects/`)
-- **20s**: git worktrees (`git worktree list`, `status --porcelain`,
-  `rev-list`)
-- **60s**: GitHub data (single GraphQL query for PRs/reviews + per-repo REST
-  for Actions runs and Dependabot alerts)
-- **on popover open**: an immediate refresh fires so closed tabs disappear
-  promptly when you click the icon
+- **fast queue — 5s**: terminal tabs (`ps`) and Claude sessions (transcripts
+  under `~/.claude/projects/`)
+- **slow queue — 20s**: local services (`lsof`) and git worktrees
+  (`git worktree list`, `status --porcelain`, `rev-list`)
+- **slow queue — 60s**: GitHub data (single GraphQL query for PRs/reviews +
+  per-repo REST for Actions runs and Dependabot alerts)
+- **on popover open**: an immediate *fast* refresh fires so closed tabs
+  disappear promptly when you click the icon
+- **memory**: sampled on the main thread each 5s tick — it is three syscalls,
+  so it never queues behind a scan
+
+A tick arriving while its queue is still busy is **dropped, never queued**, so
+no backlog can form. Two queues rather than one so a slow `gh` call cannot
+hold the tab refresh behind it. Every subprocess runs through
+`Subprocess.run`, which discards stderr and enforces a wall-clock deadline —
+an undrained stderr pipe or a hung child would otherwise wedge a serial queue
+permanently.
 
 The codebase is small and grouped by responsibility:
 
@@ -146,6 +169,8 @@ The codebase is small and grouped by responsibility:
 | ----------------------------- | ----------------------------------------------------- |
 | `CCBarApp.swift`              | App entry, `AppState`, `MenuView`, all row components |
 | `PowerAssertion.swift`        | Wraps `IOPMAssertionCreateWithName` for keep-awake    |
+| `Subprocess.swift`            | The one child-process runner: no stderr pipe, hard deadline |
+| `MemoryScanner.swift`         | `host_statistics64` + sysctl → used / pressure / swap |
 | `TabScanner.swift`            | `ps` + `lsof` → terminal tabs with cwd + foreground   |
 | `LocalServicesScanner.swift`  | `lsof` listening sockets + cwds                       |
 | `ClaudeSessionScanner.swift`  | Parses `.jsonl` head/tail for cwd + title + state     |

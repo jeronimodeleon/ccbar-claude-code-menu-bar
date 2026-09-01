@@ -1,0 +1,7 @@
+# Dev-only build artifacts. build/CCBar and build/CCBar.app are tracked
+# deliberately; the sanitizer and test binaries are not.
+build/CCBar-tsan
+build/CCBar-tsan.dSYM/
+build/CCBar-tests
+build/CCBar-tests.dSYM/
+.DS_Store

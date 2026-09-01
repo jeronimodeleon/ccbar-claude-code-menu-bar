@@ -222,25 +222,21 @@ final class GitHubScanner {
         runGh(["auth", "status"]) != nil
     }
 
+    // Every gh call is network-bound, so it gets a longer leash than the local
+    // ps/lsof/git calls. A non-zero exit means unauthenticated or no access —
+    // callers already degrade to an empty result.
     private func runGh(_ args: [String]) -> Data? {
-        let task = Process()
-        task.launchPath = "/usr/bin/env"
-        task.arguments = ["gh"] + args
         // Apps launched from Finder/Dock have a minimal PATH; gh is typically
         // in /opt/homebrew/bin (Apple silicon) or /usr/local/bin (Intel).
         var env = ProcessInfo.processInfo.environment
         let extras = "/opt/homebrew/bin:/usr/local/bin"
         env["PATH"] = (env["PATH"]).map { "\($0):\(extras)" } ?? extras
-        task.environment = env
 
-        let outPipe = Pipe()
-        task.standardOutput = outPipe
-        task.standardError = Pipe()
-        do { try task.run() } catch { return nil }
-        let data = outPipe.fileHandleForReading.readDataToEndOfFile()
-        task.waitUntilExit()
-        guard task.terminationStatus == 0 else { return nil }
-        return data
+        return Subprocess.run("/usr/bin/env", ["gh"] + args,
+                              timeout: 30,
+                              environment: env,
+                              requireZeroExit: true)?
+            .data(using: .utf8)
     }
 
     private let graphqlQuery = """
