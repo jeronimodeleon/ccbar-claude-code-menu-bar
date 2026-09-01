@@ -22,6 +22,7 @@ struct TerminalTab: Identifiable, Hashable {
     let foregroundCpu: Double      // %cpu of foreground process (0–100)
     let cwd: String?               // foreground (or shell, if idle) cwd
     let processStartedAt: Date     // start time of the foreground process
+    let residentBytes: UInt64?     // RSS of the foreground process, nil if unknown
     let claudeSession: ClaudeSession?  // matched session for `claude` tabs
     var isIdle: Bool { foregroundPid == shellPid }
 
@@ -88,6 +89,7 @@ private struct PSRow {
     let stat: String
     let cpu: Double
     let etimeSeconds: Double       // elapsed time since process start
+    let residentBytes: UInt64?     // resident set size, nil if ps didn't report one
     let args: String
 
     var executable: String {
@@ -155,6 +157,7 @@ final class TabScanner {
                 foregroundCpu: tab.foregroundCpu,
                 cwd: cwds[pid],
                 processStartedAt: tab.processStartedAt,
+                residentBytes: tab.residentBytes,
                 claudeSession: nil
             )
         }
@@ -163,8 +166,9 @@ final class TabScanner {
     // Batch lsof of working dirs. One process call for all PIDs.
     private func fetchCwds(for pids: [Int32]) -> [Int32: String] {
         guard !pids.isEmpty else { return [:] }
-        let task = Process()
-        task.launchPath = "/usr/sbin/lsof"
+        // -b -w           → avoid kernel calls that can block on a hung mount
+        //                   (an lsof stuck in D state ignores SIGKILL), and
+        //                   silence the warnings that avoidance produces
         // -a              → AND the filters (without it lsof OR's, so -d cwd
         //                   would let through every other FD of the listed
         //                   PIDs and the last "n" line wins — which is how we
@@ -173,17 +177,12 @@ final class TabScanner {
         // -p PID,PID,…    → restrict to these processes
         // -d cwd          → restrict to the cwd pseudo-FD
         // -Fpn            → field output: just PID and name
-        task.arguments = ["-a",
-                          "-p", pids.map(String.init).joined(separator: ","),
-                          "-d", "cwd",
-                          "-Fpn"]
-        let pipe = Pipe()
-        task.standardOutput = pipe
-        task.standardError = Pipe()
-        do { try task.run() } catch { return [:] }
-        let data = pipe.fileHandleForReading.readDataToEndOfFile()
-        task.waitUntilExit()
-        guard let out = String(data: data, encoding: .utf8) else { return [:] }
+        guard let out = Subprocess.run("/usr/sbin/lsof",
+                                       ["-b", "-w", "-a",
+                                        "-p", pids.map(String.init).joined(separator: ","),
+                                        "-d", "cwd",
+                                        "-Fpn"])
+        else { return [:] }
 
         var result: [Int32: String] = [:]
         var currentPid: Int32?
@@ -210,21 +209,13 @@ final class TabScanner {
     }
 
     private func runPS() -> [PSRow] {
-        let task = Process()
-        task.launchPath = "/bin/ps"
         // `=` after each spec suppresses headers — we get pure data rows.
-        task.arguments = ["-axwwo", "pid=,ppid=,pgid=,tpgid=,tty=,stat=,pcpu=,etime=,args="]
-        let pipe = Pipe()
-        task.standardOutput = pipe
-        task.standardError = Pipe()
-        do {
-            try task.run()
-        } catch {
-            return []
-        }
-        let data = pipe.fileHandleForReading.readDataToEndOfFile()
-        task.waitUntilExit()
-        guard let output = String(data: data, encoding: .utf8) else { return [] }
+        // `rss` sits second-to-last: `args` must stay last because it is the
+        // only field that can contain spaces, and the parser split-limits on it.
+        guard let output = Subprocess.run(
+            "/bin/ps",
+            ["-axwwo", "pid=,ppid=,pgid=,tpgid=,tty=,stat=,pcpu=,etime=,rss=,args="]
+        ) else { return [] }
         return parsePS(output)
     }
 
@@ -232,10 +223,10 @@ final class TabScanner {
         var rows: [PSRow] = []
         for raw in output.split(separator: "\n") {
             let line = raw.drop(while: { $0 == " " || $0 == "\t" })
-            // First 8 fields are space-delimited; the 9th (args) absorbs the rest.
-            let parts = line.split(maxSplits: 8, omittingEmptySubsequences: true,
+            // First 9 fields are space-delimited; the 10th (args) absorbs the rest.
+            let parts = line.split(maxSplits: 9, omittingEmptySubsequences: true,
                                    whereSeparator: { $0 == " " || $0 == "\t" })
-            guard parts.count == 9,
+            guard parts.count == 10,
                   let pid = Int32(parts[0]),
                   let ppid = Int32(parts[1]),
                   let pgid = Int32(parts[2]),
@@ -247,7 +238,8 @@ final class TabScanner {
                 stat: String(parts[5]),
                 cpu: Double(parts[6]) ?? 0,
                 etimeSeconds: PSRow.parseEtime(parts[7]),
-                args: String(parts[8])
+                residentBytes: UInt64(parts[8]).map { $0 * 1024 },   // ps reports KB
+                args: String(parts[9])
             ))
         }
         return rows
@@ -301,6 +293,7 @@ final class TabScanner {
                 foregroundCpu: foreground.cpu,
                 cwd: nil,
                 processStartedAt: Date().addingTimeInterval(-foreground.etimeSeconds),
+                residentBytes: foreground.residentBytes,
                 claudeSession: nil
             ))
         }

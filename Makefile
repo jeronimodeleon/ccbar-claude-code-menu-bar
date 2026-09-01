@@ -11,7 +11,7 @@ DEPLOY      := -target arm64-apple-macos14.0
 OPTS        := -O -parse-as-library $(DEPLOY)
 LSREGISTER  := /System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister
 
-.PHONY: run build app install clean
+.PHONY: run build app install test tsan clean
 
 # Dev: register the bundle with LaunchServices, then exec the binary inside
 # the bundle. The lsregister step is what populates Bundle.main with a real
@@ -42,13 +42,40 @@ $(APP_BUNDLE): $(BIN) Resources/Info.plist
 	@codesign --force --sign - $(APP_BUNDLE) 2>&1 | grep -v "replacing existing signature" || true
 	@echo "Built $(APP_BUNDLE)"
 
-# Install to ~/Applications and register so first launch finds the bundle.
+# Install over the existing copy, wherever it lives, and register so launch
+# finds the bundle. Installing blindly to ~/Applications would leave an
+# already-installed /Applications copy stale — i.e. the user keeps launching
+# the old binary and keeps hitting the bug they just updated to fix.
+# Fresh installs land in ~/Applications, which needs no admin rights.
 install: app
-	@mkdir -p $(HOME)/Applications
-	@rm -rf $(HOME)/Applications/$(APP_NAME).app
-	@cp -R $(APP_BUNDLE) $(HOME)/Applications/
-	@$(LSREGISTER) -f $(HOME)/Applications/$(APP_NAME).app 2>/dev/null || true
-	@echo "Installed to ~/Applications/$(APP_NAME).app"
+	@dest=$$(if [ -d /Applications/$(APP_NAME).app ]; then echo /Applications; else echo $(HOME)/Applications; fi); \
+	mkdir -p "$$dest"; \
+	rm -rf "$$dest/$(APP_NAME).app"; \
+	cp -R $(APP_BUNDLE) "$$dest/"; \
+	$(LSREGISTER) -f "$$dest/$(APP_NAME).app" 2>/dev/null || true; \
+	echo "Installed to $$dest/$(APP_NAME).app"
+
+# Pure-logic tests. CCBarApp.swift can't be linked in (it owns @main), so this
+# builds only the self-contained units plus Tests/main.swift. -DDEBUG is what
+# makes the selfTest() bodies exist at all — without it they compile out and
+# silently "pass". Races are not covered here; use `make tsan` for those.
+TEST_SOURCES := Sources/CCBar/MemoryScanner.swift Tests/main.swift
+
+test: $(TEST_SOURCES)
+	@mkdir -p $(BIN_DIR)
+	@$(SWIFTC) -DDEBUG -g $(DEPLOY) -o $(BIN_DIR)/$(APP_NAME)-tests $(TEST_SOURCES)
+	@$(BIN_DIR)/$(APP_NAME)-tests
+
+# Thread Sanitizer build. The scan pile-up bug was a data race on
+# ClaudeSessionScanner's cache — the class of bug unit tests never catch and
+# only TSan reliably surfaces. Run this, then exercise the app (open/close the
+# popover repeatedly for a few minutes); any "WARNING: ThreadSanitizer" means
+# the serialization is still wrong. Unoptimized + debug info so reports are
+# readable.
+tsan: $(SOURCES)
+	@mkdir -p $(BIN_DIR)
+	$(SWIFTC) -DDEBUG -g -sanitize=thread -parse-as-library $(DEPLOY) -o $(BIN_DIR)/$(APP_NAME)-tsan $(SOURCES)
+	@echo "Built $(BIN_DIR)/$(APP_NAME)-tsan — run it and exercise the menu bar."
 
 clean:
 	rm -rf $(BIN_DIR)

@@ -21,6 +21,12 @@ struct GitRepo: Identifiable, Hashable {
 }
 
 final class WorktreeScanner {
+    // origin URL per worktree path. Unsynchronized on purpose: scan() is only
+    // ever called from slowQueue, so this class is single-threaded by
+    // confinement. If that ever stops holding this needs a lock — an
+    // unsynchronized dictionary under concurrent access is what crashed the app.
+    private var originCache: [String: String?] = [:]
+
     // Discovers repos from the union of cwds passed in (typically open
     // terminal tabs), then enumerates each repo's worktrees and their state.
     func scan(cwds: [String]) -> [GitRepo] {
@@ -50,6 +56,11 @@ final class WorktreeScanner {
 
             repos.append(GitRepo(id: commonDir, name: repoName, worktrees: worktrees))
         }
+        // Drop cached origins for worktrees that have gone away, so the cache
+        // tracks the live set instead of growing for the life of the process.
+        let live = Set(repos.flatMap { $0.worktrees.map(\.path) })
+        originCache = originCache.filter { live.contains($0.key) }
+
         return repos.sorted { $0.name.localizedCaseInsensitiveCompare($1.name) == .orderedAscending }
     }
 
@@ -100,9 +111,16 @@ final class WorktreeScanner {
             }
         }
 
-        // Parse `origin` remote URL → "owner/repo".
-        let originRepo = git("remote", "get-url", "origin", cwd: raw.path)
-            .flatMap(Self.parseOriginRepo)
+        // Parse `origin` remote URL → "owner/repo". Cached: this is ~18 extra
+        // subprocess spawns a minute for a value that effectively never changes.
+        let originRepo: String?
+        if let cached = originCache[raw.path] {
+            originRepo = cached
+        } else {
+            originRepo = git("remote", "get-url", "origin", cwd: raw.path)
+                .flatMap(Self.parseOriginRepo)
+            originCache[raw.path] = originRepo
+        }
 
         return Worktree(
             id: raw.path,
@@ -132,18 +150,25 @@ final class WorktreeScanner {
         return "\(parts[parts.count - 2])/\(parts.last!)"
     }
 
+    // A non-zero exit is how we detect "no upstream", "not a repo", etc., so
+    // these all require a clean exit before the output is trusted.
     private func git(_ args: String..., cwd: String? = nil) -> String? {
-        let task = Process()
-        task.launchPath = "/usr/bin/git"
-        task.arguments = (cwd.map { ["-C", $0] } ?? []) + args
-        let pipe = Pipe()
-        task.standardOutput = pipe
-        task.standardError = Pipe()
-        do { try task.run() } catch { return nil }
-        let data = pipe.fileHandleForReading.readDataToEndOfFile()
-        task.waitUntilExit()
-        guard task.terminationStatus == 0 else { return nil }
-        return String(data: data, encoding: .utf8)?
+        // --no-optional-locks keeps `status` from refreshing and rewriting
+        // .git/index, which would take index.lock and can collide with the
+        // user's own git while we poll every worktree every 20s.
+        Subprocess.run("/usr/bin/git",
+                       (cwd.map { ["-C", $0] } ?? []) + ["--no-optional-locks"] + args,
+                       environment: Self.gitEnvironment,
+                       requireZeroExit: true)?
             .trimmingCharacters(in: .whitespacesAndNewlines)
     }
+
+    // A repo with an http remote and no cached credentials makes git prompt.
+    // Subprocess already points stdin at /dev/null, so a prompt could only
+    // stall until the watchdog fired; this makes git fail immediately instead.
+    private static let gitEnvironment: [String: String] = {
+        var env = ProcessInfo.processInfo.environment
+        env["GIT_TERMINAL_PROMPT"] = "0"
+        return env
+    }()
 }
